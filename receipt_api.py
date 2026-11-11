@@ -8,7 +8,10 @@ from typing import List, Optional
 
 from pydantic import BaseModel, Field
 
-DEFAULT_MODEL = "gemini-3.8-flash"
+DEFAULT_MODEL = "gemini-3.1-flash-lite"
+# Якщо модель перевантажена (503/504) або недоступна, пробуємо запасні.
+FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash"]
+TIMEOUT_MS = 60000
 
 PROMPT = (
     "Це фото касового чека. Витягни з нього дані: назву магазину, дату (формат YYYY-MM-DD, "
@@ -40,7 +43,9 @@ def make_client(api_key: Optional[str] = None):
     key = api_key or os.getenv("GEMINI_API_KEY")
     if not key:
         raise RuntimeError("Не задано GEMINI_API_KEY (див. .env.example)")
-    return genai.Client(api_key=key)
+    from google.genai import types
+
+    return genai.Client(api_key=key, http_options=types.HttpOptions(timeout=TIMEOUT_MS))
 
 
 def extract_receipt(image_bytes: bytes, mime_type: str, client=None, model: Optional[str] = None):
@@ -48,16 +53,23 @@ def extract_receipt(image_bytes: bytes, mime_type: str, client=None, model: Opti
     from google.genai import types
 
     client = client or make_client()
-    model = model or os.getenv("GEMINI_MODEL", DEFAULT_MODEL)
-    response = client.models.generate_content(
-        model=model,
-        contents=[types.Part.from_bytes(data=image_bytes, mime_type=mime_type), PROMPT],
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=Receipt,
-            temperature=0,
-        ),
+    first = model or os.getenv("GEMINI_MODEL", DEFAULT_MODEL)
+    models = [first] + [m for m in FALLBACK_MODELS if m != first]
+    contents = [types.Part.from_bytes(data=image_bytes, mime_type=mime_type), PROMPT]
+    config = types.GenerateContentConfig(
+        response_mime_type="application/json",
+        response_schema=Receipt,
+        temperature=0,
     )
+    last_error = None
+    for name in models:
+        try:
+            response = client.models.generate_content(model=name, contents=contents, config=config)
+            break
+        except Exception as e:  # перевантаження, таймаут, модель знята
+            last_error = e
+    else:
+        raise last_error
     receipt = response.parsed
     if receipt is None:
         receipt = Receipt.model_validate_json(response.text)
